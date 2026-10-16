@@ -1,0 +1,23 @@
+# No-secret probe: proves only that a standard GitHub-hosted runner can start a job for this repository. It does NOT test any backup.
+# No secrets, no environment, no checkout, no network calls of ours, and the token has no permissions.
+name: Runner probe (no secrets)
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: runner-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Report that a standard runner started
+        run: |
+          echo "runner started: $(uname -s) $(uname -m)"
+          node --version
+          echo "probe ok (runner availability only; no backup was run)"

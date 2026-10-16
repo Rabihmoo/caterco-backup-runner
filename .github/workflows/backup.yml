@@ -1,0 +1,134 @@
+# Encrypted database backup runner. The schedule is OFF until the repository variable BACKUP_SCHEDULE_ENABLED is set to "true" by the maintainer.
+# This repository is PUBLIC, so workflow files and logs are public. Everything sensitive lives in environment secrets and in a private source repository that is
+# fetched onto the ephemeral runner with a read-only deploy key. Tool output goes to private files on the runner; only fixed status lines are printed.
+# Nothing is uploaded as an Actions artifact, cache or release. Encrypted backups go to a private Cloudflare KV store; only the PUBLIC encryption key is used here (stored as a masked secret).
+# Not every public log line is ours: GitHub's own checkout/setup actions and apt print their usual output, and the checkout of the private tools repository shows the pinned commit hash and message.
+name: Encrypted backup runner
+
+on:
+  schedule:
+    - cron: "30 2 * * *" # daily 02:30 UTC (best effort: GitHub may delay or drop scheduled runs)
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "backup = full encrypted backup; monitor = only the freshness check"
+        type: choice
+        options: [backup, monitor]
+        default: backup
+
+permissions: {}
+
+concurrency:
+  group: backup-runner
+  cancel-in-progress: false
+
+env:
+  # Reviewed full commit of the private tools repository (updated here, in this file, only after review).
+  TOOLS_SHA: 8add235016db48d756edbb7ee91e72c9a1c0180d
+
+jobs:
+  backup:
+    if: (github.event_name == 'schedule' && vars.BACKUP_SCHEDULE_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && inputs.run == 'backup')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: production-backup
+    steps:
+      - name: Fetch the private backup tools (read-only deploy key, no persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.TOOLS_REPO }}
+          ref: ${{ env.TOOLS_SHA }}
+          ssh-key: ${{ secrets.TOOLS_DEPLOY_KEY }}
+          persist-credentials: false
+          path: tools
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Install PostgreSQL 18 client tools and production dependencies
+        working-directory: tools
+        shell: bash
+        run: |
+          set +x
+          {
+            sudo apt-get update -y
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+            sudo apt-get install -y postgresql-client-18
+            npm ci --omit=dev --ignore-scripts
+          } > "$RUNNER_TEMP/install.log" 2>&1 || { echo "FAILED: install step (details withheld from public logs)"; exit 1; }
+          echo "install ok"
+      - name: Consistent logical backup
+        working-directory: tools
+        shell: bash
+        env:
+          PG_BIN: /usr/lib/postgresql/18/bin
+          PGSSLROOTCERT: system
+          PROD_DB_EXPECT: ${{ secrets.PROD_DB_EXPECT }}
+          PROD_DB_TARGET_ID: ${{ secrets.PROD_DB_TARGET_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          AUTH_DATABASE_URL: ${{ secrets.AUTH_DATABASE_URL }}
+          STAFF_DATABASE_URL: ${{ secrets.STAFF_DATABASE_URL }}
+          DATABASE_URL_MIGRATE: ${{ secrets.DATABASE_URL_MIGRATE }}
+          QUOTE_HMAC_KEY: ${{ secrets.QUOTE_HMAC_KEY }}
+          RATE_LIMIT_HMAC_KEY: ${{ secrets.RATE_LIMIT_HMAC_KEY }}
+          BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
+        run: |
+          set +x
+          node scripts/db-prod.mjs backup --out "$RUNNER_TEMP/backup" > "$RUNNER_TEMP/backup.log" 2>&1 || { echo "FAILED: backup step (details withheld from public logs)"; exit 1; }
+          echo "backup ok"
+      - name: Encrypt with the owner's PUBLIC key only
+        working-directory: tools
+        shell: bash
+        env:
+          BACKUP_PUBLIC_KEY: ${{ secrets.BACKUP_PUBLIC_KEY }} # a public key, but kept as a masked environment secret so it is never printed by step-environment output
+        run: |
+          set +x
+          printf '%s\n' "$BACKUP_PUBLIC_KEY" > "$RUNNER_TEMP/public.pem"
+          node scripts/backup-offhost.mjs encrypt --backup "$(ls -d "$RUNNER_TEMP"/backup/*/ | head -n 1)" --dest "$RUNNER_TEMP/encrypted" --public-key "$RUNNER_TEMP/public.pem" > "$RUNNER_TEMP/encrypt.log" 2>&1 || { echo "FAILED: encrypt step (details withheld from public logs)"; exit 1; }
+          rm -rf "$RUNNER_TEMP/backup"
+          echo "encrypt ok"
+      - name: Store in the private KV store (14 daily + 8 weekly) and verify
+        working-directory: tools
+        shell: bash
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          PROD_DB_EXPECT: ${{ secrets.PROD_DB_EXPECT }}
+        run: |
+          set +x
+          node scripts/backup-kv.mjs upload --dir "$RUNNER_TEMP/encrypted" > "$RUNNER_TEMP/kv.log" 2>&1 || { echo "FAILED: store step (details withheld from public logs)"; exit 1; }
+          node scripts/backup-kv.mjs check --database "$(echo "$PROD_DB_EXPECT" | sed -E 's#.*/##')" --max-age-hours 2 > "$RUNNER_TEMP/kvcheck.log" 2>&1 || { echo "FAILED: verification step (details withheld from public logs)"; exit 1; }
+          echo "store and verify ok"
+
+  monitor:
+    # Freshness check only. It reads KV key names and prints a fixed status. It uses its own narrow environment and no database or private-source credentials.
+    # It runs from the same schedule as the backup job, so it cannot detect that the scheduler itself stopped.
+    if: (github.event_name == 'schedule' && vars.BACKUP_SCHEDULE_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && inputs.run == 'monitor')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: backup-monitor
+    permissions:
+      contents: read # only to check out this public repository's own freshness script
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Newest complete backup must be recent
+        shell: bash
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          DB_NAME: ${{ vars.BACKUP_DATABASE_NAME }}
+        run: |
+          set +x
+          # explicit if: the step shell runs with errexit, so a bare failing command would exit before any safe message could be printed
+          if node scripts/kv-freshness.mjs > "$RUNNER_TEMP/fresh.log" 2>&1; then
+            echo "freshness ok"
+          else
+            echo "FAILED: newest complete backup is missing or stale (details withheld from public logs)"
+            exit 1
+          fi
